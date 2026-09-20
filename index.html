@@ -4054,25 +4054,61 @@ initCcSlots();
 renderCcSessions();
 
 // ===== LIVE CLOCK SYNC SUPABASE SERVER TIME =====
-let clockOffsetMs=0, clockSynced=false;
+let clockOffsetMs=0, clockSynced=false, clockSyncing=false, clockSyncTimer=null;
+const CLOCK_RESYNC_OK_MS=5*60*1000;   // sudah tersinkron → sinkron ulang tiap 5 menit
+const CLOCK_RESYNC_FAIL_MS=30*1000;   // gagal → jam lokal dulu, coba server lagi tiap 30 detik
 const MONTH_ID=['JAN','FEB','MAR','APR','MEI','JUN','JUL','AGU','SEP','OKT','NOV','DES'];
+// Sumber 1 (utama): fungsi database public.server_time_ms() → waktu server Supabase (epoch ms) lewat body JSON, tidak terkendala CORS
+async function serverTimeViaRpc(){
+  const t0=Date.now();
+  const {data,error}=await sb.rpc('server_time_ms');
+  const t1=Date.now();
+  if(error)throw new Error(error.message||'rpc gagal');
+  const ms=Number(data);
+  if(!isFinite(ms)||ms<=0)throw new Error('respons jam server tidak valid');
+  return {serverMs:ms,t0,t1};
+}
+// Sumber 2 (cadangan): header Date dari server Supabase (hanya terbaca bila diekspos CORS)
+async function serverTimeViaHeader(){
+  const t0=Date.now();
+  const res=await fetch(SUPABASE_URL+'/rest/v1/',{method:'HEAD',headers:{apikey:SUPABASE_ANON_KEY}});
+  const t1=Date.now();
+  const h=res.headers.get('date');
+  if(!h)throw new Error('no date header');
+  const ms=new Date(h).getTime();
+  if(!isFinite(ms))throw new Error('date header tidak valid');
+  return {serverMs:ms,t0,t1};
+}
+function scheduleClockSync(ms){
+  if(clockSyncTimer)clearTimeout(clockSyncTimer);
+  clockSyncTimer=setTimeout(syncServerTime,ms);
+}
+// Jam mengikuti server Supabase; baru kembali ke jam lokal bila semua sumber server gagal.
 async function syncServerTime(){
-  if(!sb){clockSynced=false;return}
+  if(clockSyncing)return;
+  clockSyncing=true;
   try{
-    const t0=Date.now();
-    const res=await fetch(SUPABASE_URL+'/rest/v1/',{method:'HEAD',headers:{apikey:SUPABASE_ANON_KEY}});
-    const t1=Date.now();
-    const serverDateHeader=res.headers.get('date');
-    if(!serverDateHeader)throw new Error('no date header');
-    const serverMs=new Date(serverDateHeader).getTime();
-    const rtt=t1-t0;
-    const estServerNow=serverMs+Math.round(rtt/2);
-    clockOffsetMs=estServerNow-t1;
-    clockSynced=true;
-  }catch(e){
-    clockSynced=false;
+    let r=null;
+    if(sb){
+      for(const src of [serverTimeViaRpc,serverTimeViaHeader]){
+        try{r=await src();break}catch(e){r=null}
+      }
+    }
+    if(r){
+      const rtt=r.t1-r.t0;
+      clockOffsetMs=(r.serverMs+Math.round(rtt/2))-r.t1;   // kompensasi setengah waktu tempuh
+      clockSynced=true;
+    }else{
+      clockOffsetMs=0;clockSynced=false;                   // gagal → jam lokal
+    }
+    scheduleClockSync(r?CLOCK_RESYNC_OK_MS:CLOCK_RESYNC_FAIL_MS);
+  }finally{
+    clockSyncing=false;
+    tickClock();
   }
 }
+// kembali dari tab/aplikasi latar belakang (timer di HP bisa tertahan) → sinkron ulang segera
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncServerTime()});
 function pad2(n){return String(n).padStart(2,'0')}
 function tickClock(){
   const el=$('liveClock');
@@ -4088,7 +4124,6 @@ function tickClock(){
 }
 syncServerTime().then(tickClock);
 setInterval(tickClock,1000);
-setInterval(syncServerTime,300000);
 
 </script>
 </body></html>
